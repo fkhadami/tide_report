@@ -1,0 +1,22 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# virtual environments
+tide_env/
+.venv/
+venv/
+
+# generated outputs
+outputs/
+
+# local secrets / keys
+key.rtf
+.env
+.env.*
+
+# editor files
+.vscode/
+.idea/
