@@ -1,5 +1,6 @@
 .DS_Store
 __pycache__/
+.pycache/
 *.pyc
 *.pyo
 *.pyd
@@ -11,11 +12,13 @@ venv/
 
 # generated outputs
 outputs/
+data/cartopy/
 
 # local secrets / keys
 key.rtf
 .env
 .env.*
+.streamlit/secrets.toml
 
 # editor files
 .vscode/

@@ -5,3 +5,5 @@ matplotlib
 reportlab
 UTide
 openai
+cartopy
+global-land-mask

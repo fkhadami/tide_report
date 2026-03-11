@@ -1,10 +1,4 @@
 # report_generator.py
-# PDF report builder (updated):
-# - Page 1: Basic statistics table + Time series figure
-# - Page 2: FFT spectrum figure
-# - Page 3: UTide constituents table + (optional) Observed vs UTide fit figure
-# - Page 4+: LLM interpretation text (optional), auto page-break
-
 from __future__ import annotations
 
 import io
@@ -16,9 +10,6 @@ from reportlab.lib.utils import ImageReader
 from reportlab.lib import colors
 
 
-# -------------------------
-# Layout helpers
-# -------------------------
 def _draw_title(c: canvas.Canvas, text: str, x: float, y: float) -> float:
     c.setFont("Helvetica-Bold", 14)
     c.drawString(x, y, text)
@@ -41,10 +32,6 @@ def _wrap_text(
     font_name: str = "Helvetica",
     font_size: int = 10,
 ) -> float:
-    """
-    Very simple text wrapper using stringWidth.
-    Returns updated y after drawing.
-    """
     c.setFont(font_name, font_size)
     words = (text or "").split()
     line = ""
@@ -72,9 +59,6 @@ def _draw_table(
     header_rows: int = 1,
     row_height: float = 16,
 ) -> float:
-    """
-    Draw a simple table (manual) and return updated y (below table).
-    """
     if not rows:
         return y
 
@@ -82,11 +66,9 @@ def _draw_table(
     table_h = n_rows * row_height
     table_w = sum(col_widths)
 
-    # Border
     c.setStrokeColor(colors.black)
     c.rect(x, y - table_h, table_w, table_h, stroke=1, fill=0)
 
-    # Lines
     for i in range(1, n_rows):
         yy = y - i * row_height
         c.line(x, yy, x + table_w, yy)
@@ -96,18 +78,15 @@ def _draw_table(
         xx += w
         c.line(xx, y, xx, y - table_h)
 
-    # Header background
     if header_rows > 0:
         c.setFillColor(colors.lightgrey)
         c.rect(x, y - header_rows * row_height, table_w, header_rows * row_height, stroke=0, fill=1)
         c.setFillColor(colors.black)
 
-    # Text
     for r_idx, row in enumerate(rows):
         yy = y - (r_idx + 0.75) * row_height
         is_header = r_idx < header_rows
         c.setFont("Helvetica-Bold" if is_header else "Helvetica", 10)
-
         xx = x + 4
         for c_idx, cell in enumerate(row):
             c.drawString(xx, yy, str(cell))
@@ -124,9 +103,6 @@ def _draw_image(
     width: float,
     height: float,
 ) -> float:
-    """
-    Draw image with bottom-left at (x, y-height). Return updated y below the image.
-    """
     try:
         img_buf.seek(0)
     except Exception:
@@ -144,21 +120,18 @@ def _new_page_with_header(c: canvas.Canvas, title: str, header: str, margin_x: f
     return y
 
 
-# -------------------------
-# Public API
-# -------------------------
 def make_pdf_report(
-    report_title: str,
+    station_name: str,
+    map_png: io.BytesIO,
     stats: Dict[str, Any],
-    ts_png: io.BytesIO,
+    ts_raw_png: io.BytesIO,
+    ts_clean_png: io.BytesIO,
     fft_png: io.BytesIO,
+    fft_peaks: List[Dict[str, Any]],
     utide: Optional[Dict[str, Any]] = None,
     utide_fit_png: Optional[io.BytesIO] = None,
     narrative_text: Optional[str] = None,
 ) -> bytes:
-    """
-    Build a multi-page PDF report.
-    """
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     page_w, page_h = A4
@@ -168,13 +141,16 @@ def make_pdf_report(
     bottom_y = 70
     content_w = page_w - 2 * margin_x
 
-    # =========================
-    # PAGE 1: Title + Stats table + Time series
-    # =========================
-    y = top_y
-    y = _draw_title(c, report_title, margin_x, y)
-    y = _draw_section_header(c, "1. Basic Statistics", margin_x, y)
+    title = f"Tidal report of {station_name}"
 
+    # 1) MAP
+    y = top_y
+    y = _draw_title(c, title, margin_x, y)
+    y = _draw_section_header(c, "1. Station Map", margin_x, y)
+    y = _draw_image(c, map_png, margin_x, y, width=content_w, height=320)
+
+    # 2) STATISTICS
+    y = _new_page_with_header(c, title, "2. Statistics of the Data", margin_x, top_y)
     stats_rows = [
         ["Metric", "Value"],
         ["Start time", str(stats.get("start_time", "-"))],
@@ -187,8 +163,8 @@ def make_pdf_report(
         ["Min WL", f"{stats.get('min', 0):.4f}"],
         ["Max WL", f"{stats.get('max', 0):.4f}"],
         ["Range (max-min)", f"{stats.get('range', 0):.4f}"],
+        ["Spikes removed", str(stats.get("n_spikes_removed", "-"))],
     ]
-
     y = _draw_table(
         c,
         x=margin_x,
@@ -199,84 +175,72 @@ def make_pdf_report(
         row_height=16,
     )
 
-    y = _draw_section_header(c, "2. Time Series", margin_x, y)
-    img_h = 260
-    y = _draw_image(c, ts_png, margin_x, y, width=content_w, height=img_h)
+    # 3) RAW TS
+    y = _new_page_with_header(c, title, "3. Time Series of Raw Data", margin_x, top_y)
+    y = _draw_image(c, ts_raw_png, margin_x, y, width=content_w, height=350)
 
-    # =========================
-    # PAGE 2: FFT spectrum
-    # =========================
-    y = _new_page_with_header(c, report_title, "3. FFT Spectrum", margin_x, top_y)
+    # 4) CLEAN TS
+    y = _new_page_with_header(c, title, "4. Time Series after Spike Cleaning", margin_x, top_y)
+    y = _draw_image(c, ts_clean_png, margin_x, y, width=content_w, height=350)
 
-    y = _wrap_text(
+    # 5) FFT FIGURE + TABLE
+    y = _new_page_with_header(c, title, "5. FFT Spectrum", margin_x, top_y)
+    y = _draw_image(c, fft_png, margin_x, y, width=content_w, height=260)
+    y = _draw_section_header(c, "6. FFT Peaks (Top 8)", margin_x, y)
+    peak_rows = [["No", "Period (hours)", "Amplitude"]]
+    for i, p in enumerate(fft_peaks[:8], start=1):
+        peak_rows.append(
+            [
+                str(i),
+                f"{float(p.get('period_hours', 0.0)):.3f}",
+                f"{float(p.get('amplitude', 0.0)):.5f}",
+            ]
+        )
+    y = _draw_table(
         c,
-        "Amplitude spectrum ditampilkan sebagai fungsi periode (jam). "
-        "Puncak dominan di sekitar ~12–13 jam sering terkait komponen semi-diurnal, "
-        "sementara ~24–26 jam terkait komponen diurnal.",
-        margin_x,
-        y,
-        max_width=content_w,
-        leading=12,
+        x=margin_x,
+        y=y,
+        col_widths=[content_w * 0.15, content_w * 0.42, content_w * 0.43],
+        rows=peak_rows,
+        header_rows=1,
+        row_height=16,
     )
 
-    img_h2 = 360
-    y = _draw_image(c, fft_png, margin_x, y, width=content_w, height=img_h2)
-
-    # =========================
-    # PAGE 3: UTide constituents + optional fit plot
-    # =========================
-    y = _new_page_with_header(c, report_title, "4. Harmonic Analysis (UTide)", margin_x, top_y)
-
-    if not utide:
-        y = _wrap_text(c, "UTide results not available.", margin_x, y, max_width=content_w)
+    # 7) UTIDE FIGURE + TABLE
+    y = _new_page_with_header(c, title, "7. Harmonic Analysis (UTide): Data vs Reconstruction", margin_x, top_y)
+    if utide_fit_png is not None:
+        y = _draw_image(c, utide_fit_png, margin_x, y, width=content_w, height=250)
     else:
-        ran = bool(utide.get("utide_ran", False))
-        if not ran:
-            reason = utide.get("reason", "UTide not run.")
-            y = _wrap_text(c, f"UTide skipped: {reason}", margin_x, y, max_width=content_w)
-        else:
-            y = _wrap_text(
-                c,
-                f"UTide ran successfully. Duration: {utide.get('duration_days', 0):.2f} days. "
-                f"Latitude: {utide.get('lat', 'None')}. Points used: {utide.get('n_points', '-')}.",
-                margin_x,
-                y,
-                max_width=content_w,
+        y = _wrap_text(c, "UTide reconstruction figure not available.", margin_x, y, max_width=content_w)
+
+    y = _draw_section_header(c, "8. Dominant Constituents", margin_x, y)
+    if utide and utide.get("utide_ran", False):
+        cons = utide.get("constituents", []) or []
+        cons_rows = [["Constituent", "Amplitude", "Phase (deg)"]]
+        for row in cons:
+            cons_rows.append(
+                [
+                    str(row.get("name", "")),
+                    f"{float(row.get('amplitude', 0.0)):.4f}",
+                    f"{float(row.get('phase_deg', 0.0)):.2f}",
+                ]
             )
+        y = _draw_table(
+            c,
+            x=margin_x,
+            y=y,
+            col_widths=[content_w * 0.34, content_w * 0.33, content_w * 0.33],
+            rows=cons_rows,
+            header_rows=1,
+            row_height=16,
+        )
+    else:
+        reason = (utide or {}).get("reason", "UTide result not available.")
+        y = _wrap_text(c, f"UTide skipped/failed: {reason}", margin_x, y, max_width=content_w)
 
-            constituents = utide.get("constituents", []) or []
-            table_rows = [["Constituent", "Amplitude", "Phase (deg)"]]
-            for row in constituents:
-                table_rows.append(
-                    [
-                        str(row.get("name", "")),
-                        f"{float(row.get('amplitude', 0.0)):.4f}",
-                        f"{float(row.get('phase_deg', 0.0)):.2f}",
-                    ]
-                )
-
-            y = _draw_table(
-                c,
-                x=margin_x,
-                y=y,
-                col_widths=[content_w * 0.34, content_w * 0.33, content_w * 0.33],
-                rows=table_rows,
-                header_rows=1,
-                row_height=16,
-            )
-
-            if utide_fit_png is not None and y > (bottom_y + 120):
-                y = _draw_section_header(c, "UTide Reconstruction (Observed vs Fit)", margin_x, y)
-                img_h3 = min(260, max(160, y - bottom_y))
-                y = _draw_image(c, utide_fit_png, margin_x, y, width=content_w, height=img_h3)
-
-    # =========================
-    # PAGE 4+: LLM Interpretation (optional)
-    # =========================
+    # 9) LLM ANALYSIS
     if narrative_text:
-        y = _new_page_with_header(c, report_title, "5. Interpretation (LLM)", margin_x, top_y)
-
-        # print paragraph by paragraph; auto page-break
+        y = _new_page_with_header(c, title, "9. LLM Analysis", margin_x, top_y)
         for para in narrative_text.split("\n"):
             para = para.strip()
             if not para:
@@ -284,7 +248,7 @@ def make_pdf_report(
             else:
                 y = _wrap_text(c, para, margin_x, y, max_width=content_w, leading=12)
             if y < bottom_y:
-                y = _new_page_with_header(c, report_title, "5. Interpretation (LLM) (cont.)", margin_x, top_y)
+                y = _new_page_with_header(c, title, "9. LLM Analysis (cont.)", margin_x, top_y)
 
     c.save()
     buf.seek(0)

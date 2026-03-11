@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import io
+import os
 from typing import Optional, List, Dict, Any
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -86,6 +88,46 @@ def summarize_stats(df: pd.DataFrame) -> Dict[str, Any]:
     return stats
 
 
+def clean_spikes_hampel(
+    df: pd.DataFrame,
+    window_size: int = 9,
+    n_sigma: float = 3.0,
+) -> Dict[str, Any]:
+    """
+    Hampel spike filter:
+    - detect outliers using rolling median + MAD
+    - replace detected spikes with rolling median
+    Returns:
+      {
+        "df_clean": DataFrame(time, wl),
+        "n_spikes_removed": int
+      }
+    """
+    if window_size < 3 or window_size % 2 == 0:
+        raise ValueError("window_size must be odd and >= 3.")
+    if n_sigma <= 0:
+        raise ValueError("n_sigma must be > 0.")
+
+    dfv = df.copy()
+    s = dfv["wl"].astype(float)
+    med = s.rolling(window=window_size, center=True, min_periods=1).median()
+    abs_dev = (s - med).abs()
+    mad = abs_dev.rolling(window=window_size, center=True, min_periods=1).median()
+    sigma = 1.4826 * mad
+
+    spike_mask = (s - med).abs() > (n_sigma * sigma)
+    spike_mask = spike_mask.fillna(False)
+
+    s_clean = s.copy()
+    s_clean[spike_mask] = med[spike_mask]
+    dfv["wl"] = s_clean
+
+    return {
+        "df_clean": dfv,
+        "n_spikes_removed": int(spike_mask.sum()),
+    }
+
+
 def assert_regular_sampling(
     df: pd.DataFrame,
     expected_dt_hours: float,
@@ -109,6 +151,59 @@ def assert_regular_sampling(
             f"Sampling interval mismatch. Expected dt={expected_dt_hours:.4f} hours, "
             f"median dt={dt_med/3600.0:.4f} hours."
         )
+
+
+def require_complete_regular_series(
+    df: pd.DataFrame,
+    expected_dt_hours: float,
+    tolerance_seconds: float = 60.0,
+) -> pd.DataFrame:
+    """
+    Return a sorted copy suitable for FFT/UTide.
+
+    Spectral and harmonic methods require a complete regularly sampled series.
+    This helper rejects:
+    - duplicate timestamps
+    - missing water levels
+    - timestamp gaps/irregular spacing
+    """
+    if expected_dt_hours <= 0:
+        raise ValueError("expected_dt_hours must be > 0.")
+
+    dfv = df.sort_values("time").reset_index(drop=True).copy()
+    if len(dfv) < 2:
+        raise ValueError("Not enough data to evaluate sampling interval.")
+
+    duplicated = dfv["time"].duplicated(keep=False)
+    if duplicated.any():
+        n_dup = int(duplicated.sum())
+        raise ValueError(
+            f"Duplicate timestamps detected ({n_dup} rows). "
+            "FFT/UTide require one sample per timestamp."
+        )
+
+    missing_mask = dfv["wl"].isna()
+    if missing_mask.any():
+        n_missing = int(missing_mask.sum())
+        raise ValueError(
+            f"Missing water levels detected ({n_missing} rows). "
+            "FFT/UTide require a complete regular series; fill or resample gaps first."
+        )
+
+    dt = dfv["time"].diff().dt.total_seconds().dropna()
+    if len(dt) == 0:
+        raise ValueError("Cannot determine sampling interval.")
+
+    expected_dt_seconds = float(expected_dt_hours) * 3600.0
+    irregular = (dt - expected_dt_seconds).abs() > tolerance_seconds
+    if irregular.any():
+        dt_unique_hours = sorted({round(v / 3600.0, 6) for v in dt[irregular].tolist()[:5]})
+        raise ValueError(
+            "Irregular timestamps detected. "
+            f"Expected dt={expected_dt_hours:.4f} hours, found non-matching intervals such as {dt_unique_hours} hours."
+        )
+
+    return dfv
 
 
 def assert_hourly(df: pd.DataFrame, tolerance_seconds: float = 60.0) -> None:
@@ -135,9 +230,7 @@ def compute_fft_spectrum_hourly(
       - period_hours
       - amplitude
     """
-    assert_regular_sampling(df, expected_dt_hours=dt_hours)
-
-    dfv = df.dropna(subset=["wl"]).sort_values("time").copy()
+    dfv = require_complete_regular_series(df, expected_dt_hours=dt_hours)
     x = dfv["wl"].to_numpy(dtype=float)
 
     if len(x) < 48:
@@ -246,9 +339,8 @@ def run_utide_hourly(
     constituents_top_k: int = 12,
     dt_hours: float = 1.0,
 ) -> Dict[str, Any]:
-    dfv = df.dropna(subset=["wl"]).sort_values("time").copy()
     try:
-        assert_regular_sampling(dfv, expected_dt_hours=dt_hours)
+        dfv = require_complete_regular_series(df, expected_dt_hours=dt_hours)
     except ValueError as e:
         return {
             "utide_ran": False,
@@ -273,41 +365,49 @@ def run_utide_hourly(
     t = pd.to_datetime(dfv["time"]).to_numpy()          # datetime64[ns]
     u = dfv["wl"].to_numpy(dtype=float)
 
-    coef = solve(
-        t, u,
-        lat=lat,
-        method="ols",
-        conf_int="linear",
-        trend=False,
-        Rayleigh_min=1.0,
-    )
+    try:
+        coef = solve(
+            t, u,
+            lat=lat,
+            method="ols",
+            conf_int="linear",
+            trend=False,
+            Rayleigh_min=1.0,
+        )
 
-    names = [str(n) for n in coef.name]
-    amps = np.array(coef.A, dtype=float)
-    phases = np.array(coef.g, dtype=float)
+        names = [str(n) for n in coef.name]
+        amps = np.array(coef.A, dtype=float)
+        phases = np.array(coef.g, dtype=float)
 
-    order = np.argsort(amps)[::-1]
-    top = order[:constituents_top_k] if len(order) > constituents_top_k else order
+        order = np.argsort(amps)[::-1]
+        top = order[:constituents_top_k] if len(order) > constituents_top_k else order
 
-    constituents = [{
-        "name": names[i],
-        "amplitude": float(amps[i]),
-        "phase_deg": float(phases[i]),
-    } for i in top]
+        constituents = [{
+            "name": names[i],
+            "amplitude": float(amps[i]),
+            "phase_deg": float(phases[i]),
+        } for i in top]
 
-    return {
-        "utide_ran": True,
-        "duration_days": float(duration_days),
-        "t0": str(dfv["time"].iloc[0]),
-        "n_points": int(len(dfv)),
-        "lat": None if lat is None else float(lat),
-        "constituents": constituents,
+        return {
+            "utide_ran": True,
+            "duration_days": float(duration_days),
+            "t0": str(dfv["time"].iloc[0]),
+            "n_points": int(len(dfv)),
+            "lat": None if lat is None else float(lat),
+            "constituents": constituents,
 
-        # internal (kunci agar reconstruct tidak mismatch)
-        "_coef": coef,
-        "_t": t,
-        "_u": u,
-    }
+            # internal (kunci agar reconstruct tidak mismatch)
+            "_coef": coef,
+            "_t": t,
+            "_u": u,
+        }
+    except Exception as e:
+        return {
+            "utide_ran": False,
+            "reason": f"UTide failed: {e}",
+            "duration_days": float(duration_days),
+            "constituents": [],
+        }
 
 
 def utide_reconstruct_series(utide_result: Dict[str, Any]) -> pd.DataFrame:
@@ -339,14 +439,14 @@ def utide_reconstruct_series(utide_result: Dict[str, Any]) -> pd.DataFrame:
 # -------------------------
 # 5) Plot helpers (PNG bytes)
 # -------------------------
-def plot_timeseries_png(df: pd.DataFrame) -> io.BytesIO:
+def plot_timeseries_png(df: pd.DataFrame, title: str = "Tide time series") -> io.BytesIO:
     dfv = df.dropna(subset=["wl"]).sort_values("time").copy()
     buf = io.BytesIO()
     plt.figure()
     plt.plot(dfv["time"], dfv["wl"])
     plt.xlabel("Time")
     plt.ylabel("Water level")
-    plt.title("Tide time series")
+    plt.title(title)
     plt.tight_layout()
     plt.savefig(buf, format="png", dpi=200)
     plt.close()
@@ -404,6 +504,359 @@ def plot_utide_fit_png(df: pd.DataFrame, utide_result: Dict[str, Any]) -> io.Byt
     plt.xlabel("Time")
     plt.ylabel("Water level")
     plt.title("Observed vs UTide Reconstruction")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(buf, format="png", dpi=200)
+    plt.close()
+    buf.seek(0)
+    return buf
+
+
+def plot_station_map_png(
+    station_name: str,
+    lat: float,
+    lon: float,
+    target_scale_km: float = 10.0,
+) -> io.BytesIO:
+    """
+    Draw a simple local station map with:
+    - lat/lon grid
+    - station marker
+    - dynamic scale bar in km
+    """
+    lat = float(lat)
+    lon = float(lon)
+    target_scale_km = max(1.0, float(target_scale_km))
+
+    deg_lat_per_km = 1.0 / 111.32
+    cos_lat = max(0.1, float(np.cos(np.deg2rad(lat))))
+    deg_lon_per_km = 1.0 / (111.32 * cos_lat)
+
+    def _bounds(half_width_km: float, half_height_km: float):
+        dlat = half_height_km * deg_lat_per_km
+        dlon = half_width_km * deg_lon_per_km
+        return lon - dlon, lon + dlon, lat - dlat, lat + dlat
+
+    try:
+        import cartopy.crs as ccrs  # type: ignore
+        import cartopy  # type: ignore
+        from cartopy.feature import ShapelyFeature  # type: ignore
+        from cartopy.io import shapereader  # type: ignore
+        from shapely.geometry import box  # type: ignore
+
+        # Prefer a project-local cache so datasets can be bundled offline,
+        # while still allowing Cartopy's downloader when data is missing.
+        project_data_dir = os.getenv(
+            "TIDE_AGENT_CARTOPY_DATA_DIR",
+            str((Path(__file__).resolve().parent / "data" / "cartopy")),
+        )
+        if os.path.isdir(project_data_dir):
+            cartopy.config["data_dir"] = project_data_dir
+            cartopy.config["pre_existing_data_dir"] = project_data_dir
+
+        def _bounded_feature(
+            bbox,
+            category: str,
+            name: str,
+            resolution: str,
+            facecolor: str,
+            edgecolor: str,
+            linewidth: float = 0.5,
+        ):
+            shp_path = shapereader.natural_earth(
+                resolution=resolution,
+                category=category,
+                name=name,
+            )
+            reader = shapereader.Reader(shp_path)
+            geoms = []
+            for geom in reader.geometries():
+                if geom is None or geom.is_empty or not geom.intersects(bbox):
+                    continue
+                clipped = geom.intersection(bbox)
+                if not clipped.is_empty:
+                    geoms.append(clipped)
+            if not geoms:
+                return None
+            return ShapelyFeature(
+                geoms,
+                ccrs.PlateCarree(),
+                facecolor=facecolor,
+                edgecolor=edgecolor,
+                linewidth=linewidth,
+            )
+
+        half_width_km = 50.0
+        half_height_km = 50.0
+        land_feature = None
+        coastline_feature = None
+        map_extent_label = "100 km x 100 km"
+
+        for search_half_width_km in [50.0, 100.0, 200.0, 400.0]:
+            search_half_height_km = search_half_width_km
+            lon_min, lon_max, lat_min, lat_max = _bounds(search_half_width_km, search_half_height_km)
+            bbox = box(lon_min, lat_min, lon_max, lat_max)
+            land_feature = _bounded_feature(
+                bbox=bbox,
+                category="physical",
+                name="land",
+                resolution="10m",
+                facecolor="#b0b0b0",
+                edgecolor="none",
+            )
+            coastline_feature = _bounded_feature(
+                bbox=bbox,
+                category="physical",
+                name="coastline",
+                resolution="10m",
+                facecolor="none",
+                edgecolor="black",
+                linewidth=0.6,
+            )
+            if land_feature is not None or coastline_feature is not None:
+                half_width_km = search_half_width_km
+                half_height_km = search_half_height_km
+                map_extent_label = f"{int(half_width_km * 2)} km x {int(half_height_km * 2)} km"
+                break
+
+        lon_min, lon_max, lat_min, lat_max = _bounds(half_width_km, half_height_km)
+
+        fig = plt.figure(figsize=(8, 6))
+        ax = plt.axes(projection=ccrs.PlateCarree())
+        ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+        ax.set_facecolor("white")
+
+        if land_feature is not None:
+            ax.add_feature(land_feature, zorder=2)
+        if coastline_feature is not None:
+            ax.add_feature(coastline_feature, zorder=3)
+
+        ax.scatter([lon], [lat], color="red", s=60, zorder=5, transform=ccrs.PlateCarree())
+        ax.text(lon, lat, f"  {station_name}", va="bottom", fontsize=9, transform=ccrs.PlateCarree())
+
+        gl = ax.gridlines(draw_labels=True, linewidth=0.4, color="gray", alpha=0.4, linestyle="--")
+        gl.top_labels = False
+        gl.right_labels = False
+
+        ax.set_title(f"Station Location Map (Natural Earth 10m, {map_extent_label}): {station_name}")
+
+        # Scale bar
+        scale_km = min(target_scale_km, half_width_km * 0.7)
+        scale_deg_lon = scale_km * deg_lon_per_km
+        x0 = lon_min + (lon_max - lon_min) * 0.06
+        y0 = lat_min + (lat_max - lat_min) * 0.08
+        x1 = x0 + scale_deg_lon
+        ax.plot([x0, x1], [y0, y0], color="black", linewidth=3, transform=ccrs.PlateCarree(), zorder=6)
+        ax.text(
+            (x0 + x1) / 2.0,
+            y0 + (lat_max - lat_min) * 0.03,
+            f"{scale_km:.0f} km",
+            ha="center",
+            fontsize=9,
+            transform=ccrs.PlateCarree(),
+            zorder=6,
+        )
+
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png", dpi=200)
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+    except Exception:
+        # Fallback to simple land mask if GSHHS/cartopy not available.
+        try:
+            from global_land_mask import globe  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(
+                "Map rendering needs cartopy (GSHHS) or global-land-mask fallback."
+            ) from e
+
+        n_grid = 300
+        lons = np.linspace(lon_min, lon_max, n_grid)
+        lats = np.linspace(lat_min, lat_max, n_grid)
+        lon2d, lat2d = np.meshgrid(lons, lats)
+        land_mask = globe.is_land(lat2d, lon2d).astype(float)
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.contourf(
+            lon2d,
+            lat2d,
+            land_mask,
+            levels=[-0.5, 0.5, 1.5],
+            colors=["white", "#b0b0b0"],
+            alpha=1.0,
+        )
+        ax.contour(lon2d, lat2d, land_mask, levels=[0.5], colors="black", linewidths=0.6, alpha=0.6)
+        ax.scatter([lon], [lat], color="red", s=60, zorder=5)
+        ax.text(lon, lat, f"  {station_name}", va="bottom", fontsize=9)
+        ax.set_xlim(lon_min, lon_max)
+        ax.set_ylim(lat_min, lat_max)
+        ax.set_xlabel("Longitude (deg)")
+        ax.set_ylabel("Latitude (deg)")
+        ax.set_title(f"Station Location Map (fallback, 100 km x 100 km): {station_name}")
+
+        scale_km = min(target_scale_km, half_width_km * 0.7)
+        scale_deg_lon = scale_km * deg_lon_per_km
+        x0 = lon_min + (lon_max - lon_min) * 0.06
+        y0 = lat_min + (lat_max - lat_min) * 0.08
+        x1 = x0 + scale_deg_lon
+        ax.plot([x0, x1], [y0, y0], color="black", linewidth=3)
+        ax.text((x0 + x1) / 2.0, y0 + (lat_max - lat_min) * 0.03, f"{scale_km:.0f} km", ha="center", fontsize=9)
+
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png", dpi=200)
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+
+
+def _extract_rtide_prediction(pred_raw: Any, expected_len: int) -> np.ndarray:
+    """
+    Coerce RTide Predict(...) output to a 1D float array of size expected_len.
+    """
+    if isinstance(pred_raw, pd.Series):
+        arr = pred_raw.to_numpy(dtype=float)
+    elif isinstance(pred_raw, pd.DataFrame):
+        preferred = ["prediction", "predictions", "pred", "yhat", "fit", "fitted"]
+        col = next((c for c in preferred if c in pred_raw.columns), None)
+        if col is None:
+            num_cols = pred_raw.select_dtypes(include=[np.number]).columns.tolist()
+            if not num_cols:
+                raise ValueError("RTide prediction dataframe has no numeric columns.")
+            col = num_cols[0]
+        arr = pred_raw[col].to_numpy(dtype=float)
+    elif isinstance(pred_raw, dict):
+        for k in ["prediction", "predictions", "pred", "yhat", "fit", "fitted"]:
+            if k in pred_raw:
+                arr = np.asarray(pred_raw[k], dtype=float)
+                break
+        else:
+            raise ValueError("RTide prediction dict does not contain recognized prediction keys.")
+    else:
+        arr = np.asarray(pred_raw, dtype=float)
+
+    arr = np.ravel(arr)
+    if arr.size != expected_len:
+        raise ValueError(
+            f"RTide prediction length mismatch. Expected {expected_len}, got {arr.size}."
+        )
+    return arr
+
+
+def run_rtide_analysis(
+    df: pd.DataFrame,
+    lat: Optional[float],
+    lon: Optional[float],
+    min_days: float = 15.0,
+    dt_hours: float = 1.0,
+    max_points: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Run RTide (if installed) and return a serializable result + internal arrays.
+    """
+    dfv = df.dropna(subset=["wl"]).sort_values("time").copy()
+    try:
+        assert_regular_sampling(dfv, expected_dt_hours=dt_hours)
+    except ValueError as e:
+        return {
+            "rtide_ran": False,
+            "reason": str(e),
+            "duration_days": 0.0,
+        }
+
+    if lat is None or lon is None:
+        return {
+            "rtide_ran": False,
+            "reason": "RTide requires latitude and longitude.",
+            "duration_days": 0.0,
+        }
+
+    if len(dfv) < 48:
+        return {
+            "rtide_ran": False,
+            "reason": "Too few valid points for RTide.",
+            "duration_days": 0.0,
+        }
+
+    duration_days = (dfv["time"].iloc[-1] - dfv["time"].iloc[0]).total_seconds() / 86400.0
+    if duration_days < min_days:
+        return {
+            "rtide_ran": False,
+            "reason": f"Duration {duration_days:.2f} days < {min_days:.2f} days (skip RTide).",
+            "duration_days": float(duration_days),
+        }
+
+    n_original = int(len(dfv))
+    if max_points is not None and max_points > 0 and len(dfv) > max_points:
+        idx = np.linspace(0, len(dfv) - 1, num=int(max_points), dtype=int)
+        dfv = dfv.iloc[idx].copy()
+
+    try:
+        from rtide import RTide  # type: ignore
+    except ImportError:
+        return {
+            "rtide_ran": False,
+            "reason": "Package 'rtide' is not installed. Install with: pip install rtide",
+            "duration_days": float(duration_days),
+        }
+
+    try:
+        rt_df = pd.DataFrame(
+            {"observations": dfv["wl"].to_numpy(dtype=float)},
+            index=pd.to_datetime(dfv["time"]),
+        )
+
+        model = RTide(rt_df, float(lat), float(lon))
+        model.Prepare_Inputs()
+        model.Train()
+
+        pred_raw = model.Predict(rt_df.copy())
+        pred = _extract_rtide_prediction(pred_raw, expected_len=len(rt_df))
+
+        obs = rt_df["observations"].to_numpy(dtype=float)
+        residual = obs - pred
+        rmse = float(np.sqrt(np.mean(np.square(residual))))
+        mae = float(np.mean(np.abs(residual)))
+
+        return {
+            "rtide_ran": True,
+            "duration_days": float(duration_days),
+            "n_original_points": n_original,
+            "n_points": int(len(rt_df)),
+            "lat": float(lat),
+            "lon": float(lon),
+            "rmse": rmse,
+            "mae": mae,
+            "_time": pd.to_datetime(dfv["time"]).to_numpy(),
+            "_obs": obs,
+            "_pred": pred,
+            "_model": model,
+        }
+    except Exception as e:
+        return {
+            "rtide_ran": False,
+            "reason": f"RTide failed: {e}",
+            "duration_days": float(duration_days),
+        }
+
+
+def plot_rtide_fit_png(rtide_result: Dict[str, Any]) -> io.BytesIO:
+    if not rtide_result.get("rtide_ran", False):
+        raise ValueError("RTide not run.")
+
+    t = pd.to_datetime(rtide_result["_time"])
+    obs = np.asarray(rtide_result["_obs"], dtype=float)
+    pred = np.asarray(rtide_result["_pred"], dtype=float)
+
+    buf = io.BytesIO()
+    plt.figure()
+    plt.plot(t, obs, label="Observed")
+    plt.plot(t, pred, label="RTide fit")
+    plt.xlabel("Time")
+    plt.ylabel("Water level")
+    plt.title("Observed vs RTide Prediction")
     plt.legend()
     plt.tight_layout()
     plt.savefig(buf, format="png", dpi=200)
