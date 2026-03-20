@@ -6,10 +6,12 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 from analyze import (
     load_and_clean,
+    require_complete_regular_series,
     summarize_stats,
     clean_spikes_hampel,
     plot_station_map_png,
@@ -31,6 +33,15 @@ st.write("Alur kerja: 1) Analyze & Preview, 2) User approve, 3) Generate PDF.")
 
 OUTPUTS_DIR = Path("outputs")
 OUTPUTS_DIR.mkdir(exist_ok=True)
+USER_MANUAL_PATH = Path("Tide Agent User Manual.pdf")
+SAMPLE_CSV = """time,wl
+2024-01-01 00:00:00,1.12
+2024-01-01 01:00:00,1.34
+2024-01-01 02:00:00,1.08
+2024-01-01 03:00:00,0.95
+2024-01-01 04:00:00,0.89
+2024-01-01 05:00:00,1.01
+"""
 
 
 def new_run_id() -> str:
@@ -41,6 +52,72 @@ def _buf(data: bytes) -> io.BytesIO:
     b = io.BytesIO(data)
     b.seek(0)
     return b
+
+
+def _check_item(ok: bool, label: str, detail: str) -> None:
+    status = "OK" if ok else "Needs attention"
+    st.markdown(f"- **{label}**: {status}. {detail}")
+
+
+def build_upload_checks(
+    file_bytes: bytes,
+    time_col: str,
+    wl_col: str,
+    dt_hours: float,
+    lat: float | None,
+    lon: float | None,
+    run_utide: bool,
+    min_days: float,
+) -> tuple[pd.DataFrame | None, list[tuple[bool, str, str]], str | None]:
+    checks: list[tuple[bool, str, str]] = []
+
+    try:
+        raw = pd.read_csv(io.BytesIO(file_bytes))
+    except Exception as e:
+        return None, [(False, "CSV can be read", f"File could not be parsed as CSV: {e}")], None
+
+    has_time = time_col in raw.columns
+    has_wl = wl_col in raw.columns
+    checks.append((has_time and has_wl, "Required columns", f"Expected `{time_col}` and `{wl_col}`. Found: {list(raw.columns)}"))
+    if not (has_time and has_wl):
+        return None, checks, None
+
+    df = load_and_clean(io.BytesIO(file_bytes), time_col=time_col, wl_col=wl_col)
+    checks.append((len(df) > 0, "Valid timestamp rows", f"{len(df)} rows remain after parsing timestamps."))
+
+    invalid_time_count = int(pd.to_datetime(raw[time_col], errors="coerce").isna().sum())
+    checks.append((invalid_time_count == 0, "Timestamp format", f"{invalid_time_count} rows could not be parsed as time."))
+
+    wl_numeric = pd.to_numeric(raw[wl_col], errors="coerce")
+    non_numeric_wl_count = int((raw[wl_col].notna() & wl_numeric.isna()).sum())
+    checks.append((non_numeric_wl_count == 0, "Water level values", f"{non_numeric_wl_count} rows are non-numeric."))
+
+    duplicate_count = int(df["time"].duplicated(keep=False).sum())
+    checks.append((duplicate_count == 0, "Duplicate timestamps", f"{duplicate_count} duplicate timestamp rows detected."))
+
+    missing_wl_count = int(df["wl"].isna().sum())
+    checks.append((missing_wl_count == 0, "Missing water levels", f"{missing_wl_count} rows have missing water levels."))
+
+    regular_series_error = None
+    try:
+        require_complete_regular_series(df, expected_dt_hours=float(dt_hours))
+        checks.append((True, "Regular sampling interval", f"Matches configured `dt={dt_hours:.4f}` hours."))
+    except Exception as e:
+        regular_series_error = str(e)
+        checks.append((False, "Regular sampling interval", regular_series_error))
+
+    has_coordinates = lat is not None and lon is not None
+    checks.append((has_coordinates, "Station coordinates", "Latitude and longitude are required for the station map."))
+
+    if run_utide:
+        duration_days = 0.0
+        dfv = df.dropna(subset=["wl"]).sort_values("time")
+        if len(dfv) >= 2:
+            duration_days = (dfv["time"].iloc[-1] - dfv["time"].iloc[0]).total_seconds() / 86400.0
+        utide_ready = has_coordinates and regular_series_error is None and duration_days >= float(min_days)
+        checks.append((utide_ready, "UTide readiness", f"Duration is {duration_days:.2f} days; minimum configured is {float(min_days):.2f} days."))
+
+    return df, checks, regular_series_error
 
 
 # -------------------------
@@ -103,17 +180,79 @@ if use_llm:
 # -------------------------
 # Main
 # -------------------------
+with st.expander("How to use this app", expanded=True):
+    st.markdown(
+        """
+Prepare the following before upload:
+- CSV file with a time column and a water-level column
+- Station name
+- Latitude and longitude for the station map
+- Correct sampling interval in hours
+
+Data rules:
+- Default column names are `time` and `wl`
+- Time values should look like `2024-01-01 00:00:00`
+- Water-level values must be numeric
+- FFT and UTide need one sample per timestamp, no missing water levels, and regular sampling
+- UTide works best when the data duration is long enough for the configured minimum days
+
+Outputs:
+- Summary statistics
+- Raw and cleaned time series plots
+- FFT spectrum and peak periods
+- UTide reconstruction and constituents
+- PDF report
+"""
+    )
+    c1, c2 = st.columns(2)
+    c1.download_button(
+        label="Download sample CSV",
+        data=SAMPLE_CSV.encode("utf-8"),
+        file_name="sample_tide_data.csv",
+        mime="text/csv",
+    )
+    if USER_MANUAL_PATH.exists():
+        c2.download_button(
+            label="Download user manual",
+            data=USER_MANUAL_PATH.read_bytes(),
+            file_name=USER_MANUAL_PATH.name,
+            mime="application/pdf",
+        )
+
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
 if uploaded is None:
+    with st.expander("Pre-upload checklist", expanded=True):
+        _check_item(bool(station_name.strip()), "Station name", "Fill in the station name in the sidebar.")
+        _check_item(lat is not None and lon is not None, "Coordinates", "Enter latitude and longitude to generate the station map.")
+        _check_item(float(dt_hours) > 0, "Sampling interval", "Set the expected interval between samples in hours.")
+        _check_item(True, "CSV format", f"Prepare columns named `{time_col}` and `{wl_col}`.")
     st.info("Silakan upload CSV untuk mulai.")
     st.stop()
 
 file_bytes = uploaded.getvalue()
 
+df_preview, upload_checks, regular_series_error = build_upload_checks(
+    file_bytes=file_bytes,
+    time_col=time_col,
+    wl_col=wl_col,
+    dt_hours=float(dt_hours),
+    lat=lat,
+    lon=lon,
+    run_utide=run_utide,
+    min_days=float(min_days),
+)
+
+with st.expander("Pre-upload checklist", expanded=True):
+    for ok, label, detail in upload_checks:
+        _check_item(ok, label, detail)
+    if regular_series_error:
+        st.caption("FFT and UTide may be skipped until the sampling interval or missing-data issue is fixed.")
+
 with st.expander("Preview data (10 baris pertama)"):
     try:
-        df_preview = load_and_clean(io.BytesIO(file_bytes), time_col=time_col, wl_col=wl_col)
-        st.dataframe(df_preview.head(10), use_container_width=True)
+        if df_preview is None:
+            raise ValueError("Preview is not available because the uploaded file does not pass the basic column checks.")
+        st.dataframe(df_preview.head(10), width="stretch")
     except Exception as e:
         st.error(f"Gagal membaca file: {e}")
         st.stop()
