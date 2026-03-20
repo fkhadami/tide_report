@@ -62,6 +62,31 @@ The project also includes launcher scripts:
 - [`Launch Tide Agent.command`](/Users/fkhadami/Documents/tide_agent/Launch%20Tide%20Agent.command)
 - [`Launch Tide Agent.bat`](/Users/fkhadami/Documents/tide_agent/Launch%20Tide%20Agent.bat)
 
+## Deploy Online
+
+The simplest way to publish this app is with Streamlit Community Cloud.
+
+Repository settings:
+- Repository: `fkhadami/tide_report`
+- Branch: `main`
+- Main file path: `app.py`
+
+Steps:
+1. Sign in at https://share.streamlit.io/ with your GitHub account.
+2. Click `Create app`.
+3. Select repository `fkhadami/tide_report`.
+4. Set branch to `main`.
+5. Set main file path to `app.py`.
+6. Deploy.
+
+Optional secret for LLM narrative:
+
+```toml
+OPENAI_API_KEY="your_api_key_here"
+```
+
+Add that value in the app settings under `Secrets` after deployment. If you skip it, the rest of the app still works and only the LLM-generated narrative is unavailable.
+
 ## Input CSV Format
 
 The app expects a CSV containing:
